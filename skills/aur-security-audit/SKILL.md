@@ -17,7 +17,7 @@ Decide whether a specific AUR package is safe to build from its reviewed source,
 
 ### 1. Collect
 
-Needs Python 3.12+, git, bash, and network. Run the collector from this skill's directory (`scripts/` and `references/` sit beside this `SKILL.md`), or give its absolute path.
+Needs Python 3.12.11+, 3.13.4+, or 3.14+ (patched tarfile extraction filter), git, bash, and network. Run the collector from this skill's directory (`scripts/` and `references/` sit beside this `SKILL.md`), or give its absolute path.
 
 ```bash
 # from this skill's directory:
@@ -27,13 +27,13 @@ python3 scripts/audit.py <pkgname> \
 python3 scripts/audit.py --pkgbuild ./<pkgbase>
 ```
 
-Exit status: `2` = HIGH findings, `0` = none, `1` = collector error, `64` = usage error. The script fetches AUR RPC metadata, the cgit snapshot, and the package git repo; it never executes package text.
+Exit status: `2` = HIGH findings, `0` = no HIGH findings (MEDIUM/LOW/INFO may still be present), `1` = collector error, `64` = usage error. The script fetches AUR RPC metadata, the cgit snapshot, and the package git repo; it never executes package text.
 
 Completion: metadata, sources, findings, history, and the kept snapshot path printed. If the collector errors, relay its message; do not substitute memory.
 
 ### 2. Read the last change and its author
 
-AUR attacks land as a version bump. The report prints the last PKGBUILD/`.install` diff and per-author commit counts. It also groups authors by email, so one person using two addresses is not mistaken for a new author.
+AUR attacks land as a version bump. The report prints the last PKGBUILD/`.install` diff and per-author commit counts. It groups commits by email, so one person using two names with one address is merged; two addresses remain separate entries and you must correlate the names yourself.
 
 Classify every added/removed line as routine (`pkgver`, `pkgrel`, sums bumped together, spelling) or escalation (source URL or host changed, checksum removed/`SKIP`ped, `.install` added, a command added to `build()`/`package()`). Routine bumps by the long-standing author are the normal case; a bump by an author with `commits <= 2` is the takeover signature. The collector cannot see AUR comments: open the AUR page and check the comments and `Maintainer:` header history around the newest commit yourself.
 
@@ -58,9 +58,9 @@ python3 scripts/audit.py <pkgname> \
   --cache-dir /tmp/aur-cache --json /tmp/<pkgname>.json
 ```
 
-Local snapshot files are hashed on every run. `--verify-sources` downloads each `https://` non-VCS source and recomputes the strongest declared checksum (60 s per network operation; a blocked host becomes `source-unverified`). `verify=verified` clears that source; `MISMATCH` is a BLOCK; VCS and remote signature sources report `not-applicable`, while a local `.sig` is still hashed. A variable the collector cannot expand is `source-unresolved` and keeps the verdict below PASS. `--cache-dir` keeps the verified bytes and reports the matching `SRCDEST` for the build, so makepkg does not download them again. The collector verifies npm registry signatures when `openssl` is available; for other signatures it only hashes files, and the clean-chroot build verifies a `.sig` source when the PKGBUILD declares one.
+Local snapshot files with a strong declared checksum are hashed on every run. `--verify-sources` downloads each `https://` non-VCS source and recomputes the strongest declared checksum (60 s per network operation; a blocked host becomes `source-unverified`). `verify=verified` clears that source; `MISMATCH` is a BLOCK; VCS and remote signature sources report `not-applicable`, while a local `.sig` is still hashed. A variable or expansion the collector cannot resolve (`${x/…}`, `${arr[@]…}`) is `source-unresolved` and keeps the verdict below PASS; source/checksum assignments inside a function or conditional block are reported as `array-index-unresolved` and do not define the build-time array. `--cache-dir` keeps verified bytes with a `.url` sidecar so a same-named file from another URL is never reused or overwritten; it reports the matching `SRCDEST` for the build. The collector verifies npm registry signatures when `openssl` is available; for other signatures it only hashes files, and the clean-chroot build verifies a `.sig` source when the PKGBUILD declares one.
 
-A matching hash proves the file equals the PKGBUILD's sum, not that the sum came from upstream. For every remote source, find the upstream-published checksum or signature (release `SHA256SUMS`, `.sig`, release notes) and compare. For a GitHub release asset the script computes SHA-256 independently of the algorithm declared in the PKGBUILD, fetches the `SHA256SUMS` beside the asset, and reports `provenance: upstream SHA256SUMS matches` or `differs`. `provenance-mismatch` is a BLOCK. For `registry.npmjs.org` tarballs the collector compares the download with the version's `dist.integrity` and `dist.shasum`, verifies the registry ECDSA signatures when `openssl` is installed, and reports the result as `provenance: npm ...`. For a vendor-hosted payload with no release sums, use the vendor's own update manifest as described in [`references/provenance.md`](references/provenance.md); it is unsigned HTTPS metadata, so record the exact URL and say so. Other forges are not compared: record `none` by hand. `prebuilt-payload` (a `-bin` name, a downloaded `.deb`/`.rpm`/`.AppImage`/`.run`, or a package with no `build()` that only extracts a payload) is cleared only by recording that comparison; "no upstream checksum" leaves it open.
+A matching hash proves the file equals the PKGBUILD's sum, not that the sum came from upstream. For every remote source, find the upstream-published checksum or signature (release `SHA256SUMS`, `.sig`, release notes) and compare. For a GitHub release asset the script computes SHA-256 independently of the algorithm declared in the PKGBUILD, fetches the `SHA256SUMS` beside the asset, and reports `provenance: upstream SHA256SUMS matches` or `differs`. `provenance-mismatch` is a BLOCK. For `registry.npmjs.org` tarballs the collector compares the download with the version's `dist.integrity` and `dist.shasum`, verifies the registry ECDSA signatures when `openssl` is installed, and reports the result as `provenance: npm ...`. For a vendor-hosted payload with no release sums, use the vendor's own update manifest as described in [`references/provenance.md`](references/provenance.md); it is unsigned HTTPS metadata, so record the exact URL and say so. Other forges are not compared: record `none` by hand. `prebuilt-payload` (a `-bin` name, a downloaded `.deb`/`.rpm`/`.AppImage`/`.run`/`.7z`, or a package with no `build()` that only extracts a payload) is cleared only by recording that comparison; "no upstream checksum" leaves it open.
 
 Completion: every source row carries verified / MISMATCH / an explicit unverifiable reason, every remote source has a provenance line (match, differs, or none), and npm sources report integrity/shasum status with signatures verified, absent, or `openssl`-absent.
 
@@ -89,7 +89,7 @@ chown -R "$(id -u):$(id -g)" "$build/pkg"   # container builder is UID 1000
 
 The container is disposable, `makepkg` runs as a non-root builder, and `--nodeps`/`--skippgpcheck`/`--nocheck` remain prohibited. A failing build is a finding, not a reason to weaken flags. If the audit used `--cache-dir`, point makepkg at it: `SRCDEST=/tmp/aur-cache makepkg -s`.
 
-Then inventory what shipped: `python3 scripts/inspect_pkg.py *.pkg.tar.zst` (requires `bsdtar`; install `namcap` to include its findings). It prints PKGINFO, file count/size, SUID/SGID, world-writable files, `.INSTALL`, launcher hashes and sandbox flags, and namcap `E:`/missing-dependency lines. Read every installed helper script and `.desktop` `Exec=` yourself.
+Then inventory what shipped: `python3 scripts/inspect_pkg.py *.pkg.tar.zst` (uses Python's `tarfile`; `bsdtar` is a fallback on interpreters without zstd support; install `namcap` to include its findings). It prints PKGINFO, file count/size, SUID/SGID, world-writable files, `.INSTALL`, launcher hashes and sandbox flags, and namcap `E:`/missing-dependency lines. Read every installed helper script and `.desktop` `Exec=` yourself.
 
 Four checks it enables:
 

@@ -1,6 +1,6 @@
 # AUR threat model
 
-The AUR hosts build scripts, not binaries. Whatever the PKGBUILD says runs on your machine, as your user, with your SSH keys and token paths visible, and `makepkg` post-install hooks run as root. The package text is the attack surface.
+The AUR hosts build scripts, not binaries. Whatever the PKGBUILD says runs on your machine, as your user, with your SSH keys and token paths visible. A clean-chroot build only produces the package's `.install` scriptlet; installing the built package (`pacman -U`, `pkgctl build -i --install-to-host`) then sources it as root. The package text is the attack surface.
 
 ## Attack patterns, in order of observed frequency
 
@@ -24,7 +24,7 @@ The AUR hosts build scripts, not binaries. Whatever the PKGBUILD says runs on yo
 
 **`.install` root execution.** `post_install` runs as root and is easy to overlook. Every command in an `.install` function is listed (`install-script-command`), and writes to system paths, `sed -i`, `rm`, `chmod`, `chown` or redirections raise `install-script-root-write`; network/credential/privilege patterns inside `.install` are HIGH.
 
-**Prebuilt payload (`-bin` and friends).** Nothing is compiled, so review cannot see inside the blob; the checksum only binds you to whatever the maintainer downloaded. The name is not reliable: `google-chrome` ships a `.deb`, `spotify` ships a `.deb`, and neither ends in `-bin`. The collector flags a downloaded `.deb`/`.rpm`/`.AppImage`/`.run`, a `-bin` name, or a package with no `build()` whose `package()` only extracts a payload. Demand: an upstream-published hash or signature for this exact file. The collector compares a GitHub release asset's SHA-256 with the `SHA256SUMS` beside it when `--verify-sources` runs, and reports `prebuilt-payload` until that comparison is recorded.
+**Prebuilt payload (`-bin` and friends).** Nothing is compiled, so review cannot see inside the blob; the checksum only binds you to whatever the maintainer downloaded. The name is not reliable: `google-chrome` ships a `.deb`, `spotify` ships a `.deb`, and neither ends in `-bin`. The collector flags a downloaded `.deb`/`.rpm`/`.AppImage`/`.run`/`.7z`, a `-bin` name, or a package with no `build()` whose `package()` only extracts a payload. Demand: an upstream-published hash or signature for this exact file. The collector compares a GitHub release asset's SHA-256 with the `SHA256SUMS` beside it when `--verify-sources` runs, and reports `prebuilt-payload` until that comparison is recorded.
 
 **Transitive AUR dependencies.** A clean PKGBUILD can `depends` on another AUR package that is not clean. The audit covers one package; walk the `depends`/`makedepends` chain with the same gate when it resolves to AUR.
 
@@ -44,7 +44,7 @@ The AUR hosts build scripts, not binaries. Whatever the PKGBUILD says runs on yo
 - That the built binary does nothing hostile at runtime, including the launch flags and network traffic the app uses after start.
 - That the maintainer's AUR account is uncompromised.
 - That a correctly signed upstream release is not malicious.
-- That a `.sig`/`.asc`/`.gpg` source was cryptographically verified. The collector hashes files and verifies npm registry signatures; the clean-chroot build runs `gpg --verify` only for signature sources the PKGBUILD declares.
+- That a `.sig`/`.asc`/`.sign` source was cryptographically verified. The collector hashes files and verifies npm registry signatures; the clean-chroot build runs `gpg --verify` only for signature sources the PKGBUILD declares. A `.gpg`/`.pgp` file is not a signature to makepkg.
 - That the package's AUR dependencies are clean, or that the build is reproducible.
 
 Say which of these were not covered. A verdict that hides its coverage is worse than `REVIEW`.

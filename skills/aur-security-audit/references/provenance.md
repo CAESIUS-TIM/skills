@@ -65,7 +65,8 @@ run:
 
 ```bash
 bsdtar -tf pkg.deb                     # debian-binary, control.tar.*, data.tar.*
-bsdtar -xOf pkg.deb control.tar.xz | bsdtar -tf -
+ctl=$(bsdtar -tf pkg.deb | grep -E '^control\.tar\.(xz|zst|gz)$')
+bsdtar -xOf pkg.deb "$ctl" | bsdtar -tf -
 ```
 
 The second command lists the maintainer scripts (`preinst`, `postinst`,

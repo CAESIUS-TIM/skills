@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fast commit gate: block staged and tracked credentials with gitleaks.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "gitleaks required: pacman -S gitleaks (or see https://github.com/gitleaks/gitleaks)"
+    exit 1
+fi
+gitleaks git . --staged --redact --no-banner -v --config .gitleaks.toml
+gitleaks dir . --redact --no-banner -v --config .gitleaks.toml

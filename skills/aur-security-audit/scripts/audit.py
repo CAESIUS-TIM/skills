@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -30,9 +31,20 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import IO, Any, NoReturn, cast
 
-if sys.version_info < (3, 12):
-    raise SystemExit("aur-security-audit: needs Python 3.12+ (tarfile extraction filter)")
+_v = sys.version_info[:3]
+_TAR_FILTER_PATCHED = (
+    _v >= (3, 14)
+    or (3, 12, 11) <= _v < (3, 13)
+    or (3, 13, 4) <= _v < (3, 14)
+)
+if not _TAR_FILTER_PATCHED:
+    raise SystemExit(
+        "aur-security-audit: needs Python 3.12.11+, 3.13.4+, or 3.14+ "
+        "(tarfile data filter, CVE-2025-4517)"
+    )
 
 AUR = "https://aur.archlinux.org"
 UA = "aur-security-audit/1.0 (+static PKGBUILD review)"
@@ -41,11 +53,13 @@ DOWNLOAD_TIMEOUT = 60   # seconds per network operation; a blocked host must not
 HIGH, MEDIUM, LOW, INFO = "HIGH", "MEDIUM", "LOW", "INFO"
 RANK = {HIGH: 3, MEDIUM: 2, LOW: 1, INFO: 0}
 
-SUMS = {"sha512sums": 128, "sha256sums": 64, "b2sums": 128, "sha1sums": 40, "md5sums": 32}
-STRONG = ("sha512sums", "sha256sums", "b2sums")
-SIG_SUFFIX = (".sig", ".asc", ".sign", ".gpg", ".pgp")
+SUMS = {"sha512sums": 128, "sha384sums": 96, "sha256sums": 64, "sha224sums": 56,
+        "b2sums": 128, "sha1sums": 40, "md5sums": 32}
+STRONG = ("sha512sums", "sha384sums", "sha256sums", "sha224sums", "b2sums")
+# makepkg only treats these as detached signatures (verify_signature.sh).
+SIG_SUFFIX = (".sig", ".asc", ".sign")
 PATCH_SUFFIX = (".patch", ".diff")
-VCS_PREFIX = ("git+", "svn+", "hg+", "bzr+")
+VCS_PREFIX = ("git+", "svn+", "hg+", "bzr+", "fossil+")
 # Bash function names may contain hyphens (`_package-headers()` is common).
 NAME_RE = r"[A-Za-z_][A-Za-z0-9_-]*"
 # A line containing any of these can run more than one command; never exempt it whole.
@@ -61,6 +75,8 @@ PRIVILEGE_RX = re.compile(
     r"|\bsetcap\b")
 SANDBOX_RX = re.compile(
     r"--(?:no-sandbox|disable-gpu-sandbox|disable-setuid-sandbox)\b|--in-process-gpu\b")
+INSTALL_MODE_RX = re.compile(
+    r"\b(?:install|cp)\b[^\n]*?(?:-[A-Za-z]*m|--mode(?:=|\s+))\s*0?[1-7][0-7]{3}\b")
 SUMS_CACHE: dict[str, tuple[dict[str, str] | None, str]] = {}
 NPM_META_CACHE: dict[str, tuple[dict | None, str]] = {}
 NPM_KEYS_CACHE: dict[str, str] | None = None
@@ -104,7 +120,8 @@ class Report:
     popularity: float | None = None
     findings: list[Finding] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
-    authors: list[dict] = field(default_factory=list)
+    authors: list[dict[str, Any]] = field(default_factory=list)
+    pkgnames: list[str] = field(default_factory=list)
     commits: int | None = None
     last_change_diff: str | None = None
     history_note: str | None = None
@@ -113,21 +130,33 @@ class Report:
     sources_verified: bool = False
     verdict: str = "REVIEW"
 
-    def add(self, severity: str, code: str, message: str, **kw) -> None:
-        self.findings.append(Finding(severity, code, message, **kw))
+    def add(self, severity: str, code: str, message: str, *,
+            file: str = "PKGBUILD", line: int | None = None,
+            evidence: str | None = None) -> None:
+        self.findings.append(Finding(severity, code, message, file=file, line=line,
+                                     evidence=evidence))
 
 
-def fetch(url: str, timeout: int = 40, attempts: int = 2) -> bytes:
+def fetch(url: str, timeout: int = 40, attempts: int = 2,
+          max_bytes: int = 256 << 20) -> bytes:
     last: Exception | None = None
     for attempt in range(attempts):
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read()
+                final = r.geturl()
+                if urllib.parse.urlsplit(final).scheme != "https":
+                    raise ValueError(f"redirected to non-https: {final}")
+                data: bytes = r.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ValueError(f"response larger than {max_bytes} bytes: {url}")
+                return data
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last = e
             if attempt + 1 < attempts:
                 time.sleep(2)
+        except ValueError as e:
+            raise SystemExit(f"aur-security-audit: {e}")
     raise SystemExit(f"aur-security-audit: request failed for {url}: {last}")
 
 
@@ -145,10 +174,10 @@ def sh(cmd: list[str], cwd: str | None = None, timeout: int = 120) -> subprocess
                           check=False, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
 
 
-def rpc_info(name: str) -> dict:
+def rpc_info(name: str) -> dict[str, Any]:
     raw = fetch(f"{AUR}/rpc/v5/info?arg[]={urllib.parse.quote(name)}")
     try:
-        data = json.loads(raw)
+        data: Any = json.loads(raw)
     except json.JSONDecodeError as e:
         raise SystemExit(f"aur-security-audit: AUR RPC returned invalid JSON: {e}")
     if not isinstance(data, dict):
@@ -158,15 +187,15 @@ def rpc_info(name: str) -> dict:
         raise SystemExit(f"aur-security-audit: no AUR package named {name!r}")
     for r in results:
         if r.get("Name") == name:
-            return r
-    return results[0]
+            return cast(dict[str, Any], r)
+    return cast(dict[str, Any], results[0])
 
 
 def aur_maintainer_portfolio(name: str) -> str:
     """Context for a new or repack-heavy maintainer account."""
     try:
         raw = fetch(f"{AUR}/rpc/v5/search/{urllib.parse.quote(name)}?by=maintainer")
-        data = json.loads(raw)
+        data: Any = json.loads(raw)
         results = data.get("results") or []
         count = data.get("resultcount", len(results))
         dates = [r["FirstSubmitted"] for r in results if r.get("FirstSubmitted")]
@@ -182,17 +211,30 @@ def safe_extract(tar: tarfile.TarFile, dest: str) -> None:
         target = os.path.realpath(os.path.join(dest, m.name))
         if not target.startswith(root + os.sep) and target != root:
             raise SystemExit(f"snapshot member escapes destination: {m.name}")
-    tar.extractall(dest, filter="data")
+        if m.issym() or m.islnk():
+            base = os.path.dirname(target) if m.issym() else root
+            link = os.path.realpath(os.path.join(base, m.linkname))
+            if not link.startswith(root + os.sep) and link != root:
+                raise SystemExit(f"snapshot link escapes destination: {m.name} -> {m.linkname}")
+    try:
+        tar.extractall(dest, filter="data")
+    except tarfile.TarError as e:
+        raise SystemExit(f"snapshot extraction refused: {e}")
 
 
 def load_snapshot(pkgbase: str, workdir: str) -> str:
     url = f"{AUR}/cgit/aur.git/snapshot/{urllib.parse.quote(pkgbase)}.tar.gz"
     blob = fetch(url)
+    if not blob:
+        raise SystemExit("aur-security-audit: AUR returned an empty snapshot; retry the audit")
     tar_path = os.path.join(workdir, f"{pkgbase}.tar.gz")
     with open(tar_path, "wb") as f:
         f.write(blob)
-    with tarfile.open(tar_path) as tar:
-        safe_extract(tar, workdir)
+    try:
+        with tarfile.open(tar_path) as tar:
+            safe_extract(tar, workdir)
+    except tarfile.TarError as e:
+        raise SystemExit(f"aur-security-audit: snapshot is not a readable tarball: {e}")
     snap = os.path.join(workdir, pkgbase)
     if not os.path.isdir(snap):
         raise SystemExit(f"snapshot layout unexpected for {pkgbase}")
@@ -201,11 +243,20 @@ def load_snapshot(pkgbase: str, workdir: str) -> str:
 
 def git_history(pkgbase: str, workdir: str) -> tuple[list[dict], int, str | None, str | None]:
     repo = os.path.join(workdir, "git")
-    cp = sh(["git", "clone", "--quiet", f"{AUR}/{pkgbase}.git", repo], timeout=180)
+    try:
+        cp = sh(["git", "clone", "--quiet", f"{AUR}/{pkgbase}.git", repo], timeout=180)
+    except subprocess.TimeoutExpired:
+        return [], 0, None, "git clone timed out"
     if cp.returncode != 0:
         return [], 0, None, cp.stderr.strip()[:300]
-    log = sh(["git", "-C", repo, "log", "--format=%h%x1f%an%x1f%ae%x1f%aI%x1f%s"], timeout=60)
-    rows = [r.split("\x1f") for r in log.stdout.splitlines() if r.strip()]
+    try:
+        log = sh(["git", "-C", repo, "log", "--format=%h%x1f%an%x1f%ae%x1f%aI%x1f%s"], timeout=60)
+    except subprocess.TimeoutExpired:
+        return [], 0, None, "git log timed out"
+    if log.returncode != 0:
+        return [], 0, None, log.stderr.strip()[:300]
+    rows = [r.split("\x1f", 4) for r in log.stdout.splitlines() if r.strip()]
+    rows = [r for r in rows if len(r) == 5]  # a hostile ident must not crash the audit
     authors: dict[str, dict] = {}
     for _sha, name, email, date, subject in rows:  # rows are newest-first
         a = authors.setdefault(email, {"name": name, "email": email, "names": [],
@@ -221,9 +272,13 @@ def git_history(pkgbase: str, workdir: str) -> tuple[list[dict], int, str | None
             a["name"] = name
     ordered = sorted(authors.values(), key=lambda a: a["last"], reverse=True)
     diff = ""
-    d = sh(["git", "-C", repo, "diff", "--unified=2", "HEAD~1", "HEAD", "--", "PKGBUILD", "*.install"], timeout=60)
-    if d.returncode == 0:
-        diff = d.stdout.strip()
+    try:
+        d = sh(["git", "-C", repo, "diff", "--unified=2", "HEAD~1", "HEAD",
+                "--", "PKGBUILD", "*.install"], timeout=60)
+        if d.returncode == 0:
+            diff = d.stdout.strip()
+    except subprocess.TimeoutExpired:
+        pass
     return ordered, len(rows), diff, None
 
 
@@ -333,8 +388,26 @@ def _split_alts(inner: str) -> list[str]:
     return parts
 
 
+BRACE_LIMIT = 4096
+
+
+class _BraceLimit(Exception):
+    """Raised when a hostile expansion exceeds BRACE_LIMIT."""
+
+
 def brace_expand(word: str) -> list[str]:
-    """Expand one non-parameter, unquoted `{a,b}` group, as makepkg's array sees it."""
+    """Expand one non-parameter, unquoted `{a,b}` or `{n..m}` group, as makepkg sees it.
+
+    Expansions are capped: a hostile PKGBUILD must not be able to hang the audit
+    with nested comma groups. An over-limit word is returned unexpanded.
+    """
+    try:
+        return _brace_expand(word)
+    except _BraceLimit:
+        return [word]
+
+
+def _brace_expand(word: str) -> list[str]:
     quote = None
     i = 0
     while i < len(word):
@@ -351,11 +424,26 @@ def brace_expand(word: str) -> list[str]:
             if j < 0:
                 return [word]
             inner = word[i + 1:j]
-            if "," not in inner:
-                return [word]
+            alts: list[str]
+            if "," in inner:
+                alts = _split_alts(inner)
+            else:
+                rng = re.fullmatch(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?", inner)
+                if not rng:
+                    return [word]
+                a, b = int(rng.group(1)), int(rng.group(2))
+                step = int(rng.group(3)) if rng.group(3) else (1 if b >= a else -1)
+                if step == 0:
+                    return [word]
+                count = abs((b - a) // step) + 1
+                if count > BRACE_LIMIT:
+                    raise _BraceLimit
+                alts = [str(n) for n in range(a, b + (1 if step > 0 else -1), step)]
             out: list[str] = []
-            for alt in _split_alts(inner):
-                out.extend(brace_expand(word[:i] + alt + word[j + 1:]))
+            for alt in alts:
+                out.extend(_brace_expand(word[:i] + alt + word[j + 1:]))
+                if len(out) > BRACE_LIMIT:
+                    raise _BraceLimit
             return out
         i += 1
     return [word]
@@ -377,6 +465,9 @@ def _split_items(body: str, base_pos: int, text: str) -> list[tuple[str, int]]:
         elif c in "'\"":
             quote = c
             buf.append(c)
+        elif c == "\\" and i + 1 < len(body) and body[i + 1] == "\n":
+            i += 2
+            continue
         elif c in " \t\n":
             if buf:
                 items.append(("".join(buf), base_pos + i - len(buf)))
@@ -397,15 +488,103 @@ def _split_items(body: str, base_pos: int, text: str) -> list[tuple[str, int]]:
     return out
 
 
-def parse_array(text: str, name: str) -> list[tuple[str, int]] | None:
-    """Every `name=(...)`, `name+=(...)`, and `name[i]=value` assignment, in file order.
+def function_spans(text: str) -> list[tuple[int, int]]:
+    """Character spans of every function body, so build-time assignments can be separated."""
+    return [(f[4], f[5]) for f in function_bodies(text)]
 
-    Indexed assignments are applied to the array, so callers see the effective
-    value (e.g. `sha512sums[4]='SKIP'` after the literal array). A non-literal
-    index cannot be applied and is reported by `indexed_assignments()`.
-    """
-    events = []
+
+def _mask_quotes(line: str) -> str:
+    """Blank quoted spans so keyword detection does not see prose."""
+    out: list[str] = []
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                out.append("  ")
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            out.append(" ")
+        elif c in "'\"":
+            quote = c
+            out.append(" ")
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+@lru_cache(maxsize=16)
+def conditional_lines(text: str) -> frozenset[int]:
+    """Lines inside a conditional or loop block, where makepkg may never run the code."""
+    top = mask_spans(text, function_spans(text))
+    lines: set[int] = set()
+    depth = 0
+    paren = 0
+    for no, line in enumerate(top.splitlines(), start=1):
+        bare = _mask_quotes(strip_comment(line))
+        before, paren_before = depth, paren
+        words = re.findall(r"\b(if|case|for|while|until|select|fi|esac|done)\b", bare)
+        for word in words:
+            if word in ("if", "case", "for", "while", "until", "select"):
+                depth += 1
+            else:
+                depth = max(0, depth - 1)
+        paren = max(0, paren + bare.count("(") - bare.count(")"))
+        if (before or paren_before or words or re.search(r"&&|\|\|", bare)):
+            lines.add(no)
+    return frozenset(lines)
+
+
+def _scoped(pos: int, line: int, spans: list[tuple[int, int]],
+            conds: frozenset[int]) -> bool:
+    return line in conds or any(start <= pos < end for start, end in spans)
+
+
+def scoped_assignments(text: str, name: str) -> list[tuple[str, int]]:
+    """Assignments to `name` that live in a function body or conditional block."""
+    spans, conds = function_spans(text), conditional_lines(text)
+    out: list[tuple[str, int]] = []
     for m in re.finditer(rf"^[ \t]*{re.escape(name)}\+?=\s*\(", text, re.MULTILINE):
+        line = line_at(text, m.start())
+        if _scoped(m.start(), line, spans, conds):
+            out.append(("array", line))
+    for m in re.finditer(
+            rf"^[ \t]*{re.escape(name)}\[[^\]]+\][+]?=\s*[^\n]*", text, re.MULTILINE):
+        line = line_at(text, m.start())
+        if _scoped(m.start(), line, spans, conds):
+            out.append(("index", line))
+    return out
+
+
+def parse_any(text: str, name: str) -> list[tuple[str, int]] | None:
+    """Array form when present, scalar fallback otherwise (both are valid bash)."""
+    items = parse_array(text, name)
+    if items:
+        return items
+    value = parse_scalar(text, name)
+    if value is None or value == "":
+        return None
+    return [(value, line_of(text, name + "=") or 0)]
+
+
+def parse_array(text: str, name: str) -> list[tuple[str, int]] | None:
+    """Effective top-level `name=(...)`, `name+=(...)`, and `name[i]=value` assignments.
+
+    Assignments inside a function body or a conditional block are skipped: makepkg
+    verifies checksums before those run, so they never define the build-time array.
+    A non-literal top-level index is reported by `indexed_assignments()`.
+    """
+    spans, conds = function_spans(text), conditional_lines(text)
+    ArrayPayload = list[tuple[str, int]]
+    IndexPayload = tuple[str, str, str, int]
+    events: list[tuple[int, str, ArrayPayload | IndexPayload]] = []
+    for m in re.finditer(rf"^[ \t]*{re.escape(name)}\+?=\s*\(", text, re.MULTILINE):
+        if _scoped(m.start(), line_at(text, m.start()), spans, conds):
+            continue
         open_paren = m.end() - 1
         end = _match_paren(text, open_paren)
         if end < 0:
@@ -414,6 +593,8 @@ def parse_array(text: str, name: str) -> list[tuple[str, int]] | None:
                        _split_items(text[open_paren + 1:end - 1], open_paren + 1, text)))
     for m in re.finditer(
             rf"^[ \t]*{re.escape(name)}\[([^\]]+)\]([+]?)=\s*([^\n]*)", text, re.MULTILINE):
+        if _scoped(m.start(), line_at(text, m.start()), spans, conds):
+            continue
         value = strip_comment(m.group(3)).strip()
         events.append((m.start(), "index",
                        (m.group(1).strip(), m.group(2), _unquote_word(value),
@@ -424,9 +605,9 @@ def parse_array(text: str, name: str) -> list[tuple[str, int]] | None:
     items: list[tuple[str, int]] = []
     for _pos, kind, payload in events:
         if kind == "array":
-            items.extend(payload)
+            items.extend(cast(ArrayPayload, payload))
             continue
-        idx_raw, op, value, line = payload
+        idx_raw, op, value, line = cast(IndexPayload, payload)
         if not re.fullmatch(r"\d+", idx_raw):
             continue
         idx = int(idx_raw)
@@ -437,17 +618,24 @@ def parse_array(text: str, name: str) -> list[tuple[str, int]] | None:
 
 
 def indexed_assignments(text: str, name: str) -> list[tuple[str, int]]:
-    """Every `name[expr]=...` index expression and its line."""
-    return [(m.group(1).strip(), line_at(text, m.start()))
-            for m in re.finditer(
-                rf"^[ \t]*{re.escape(name)}\[([^\]]+)\][+]?=\s*[^\n]*", text, re.MULTILINE)]
+    """Every top-level `name[expr]=...` index expression and its line."""
+    spans, conds = function_spans(text), conditional_lines(text)
+    out: list[tuple[str, int]] = []
+    for m in re.finditer(
+            rf"^[ \t]*{re.escape(name)}\[([^\]]+)\][+]?=\s*[^\n]*", text, re.MULTILINE):
+        line = line_at(text, m.start())
+        if _scoped(m.start(), line, spans, conds):
+            continue
+        out.append((m.group(1).strip(), line))
+    return out
 
 
 def array_is_static(text: str, name: str) -> bool:
-    """False when `+=` or an indexed assignment makes the final array unknowable."""
+    """False when `+=`, an index, or a scoped assignment makes the final array unknowable."""
     return not (
         re.search(rf"^[ \t]*{re.escape(name)}\+=", text, re.MULTILINE)
         or re.search(rf"^[ \t]*{re.escape(name)}\[", text, re.MULTILINE)
+        or scoped_assignments(text, name)
     )
 
 
@@ -510,27 +698,45 @@ def parse_scalar(text: str, name: str) -> str | None:
     m = re.search(rf"^[ \t]*{re.escape(name)}=([^\n#]*)", text, re.MULTILINE)
     if not m:
         return None
-    return m.group(1).strip().strip("'\"")
+    raw_value = m.group(1).strip()
+    if raw_value.startswith("("):  # `name=(...)` is an array, not a scalar
+        return None
+    return raw_value.strip("'\"")
 
 
+@lru_cache(maxsize=16)
 def function_bodies(text: str) -> list[tuple[str, int, int, str, int, int]]:
     """(name, start_line, end_line, body, body_start, body_end) for every function.
 
     Accepts `name() {`, `name () {`, `function name {` and `function name() {`,
-    including a brace on the next line: all execute the same body. Names may
-    contain hyphens, as bash allows. Every definition is returned, including
-    duplicates, because a conditional branch may decide which one runs.
+    with any amount of whitespace, blank lines, or comments between `()` and `{`.
+    Names may contain hyphens, as bash allows. Every definition is returned,
+    including duplicates, because a conditional branch may decide which one runs.
     """
     out: list[tuple[str, int, int, str, int, int]] = []
     pat = re.compile(
         r"^[ \t]*(?:function[ \t]+(" + NAME_RE + r")[ \t]*(?:\(\))?"
-        r"|(" + NAME_RE + r")[ \t]*\(\))[ \t]*\n?[ \t]*\{",
+        r"|(" + NAME_RE + r")[ \t]*\(\))",
         re.MULTILINE,
     )
     for m in pat.finditer(text):
+        j = m.end()
+        while True:
+            while j < len(text) and text[j] in " \t\r":
+                j += 1
+            if j < len(text) and text[j] == "#":
+                nl = text.find("\n", j)
+                j = len(text) if nl < 0 else nl + 1
+                continue
+            if j < len(text) and text[j] == "\n":
+                j += 1
+                continue
+            break
+        if j >= len(text) or text[j] != "{":
+            continue
         name = m.group(1) or m.group(2)
-        body_start = m.end()
-        depth, i, quote = 1, body_start, None
+        body_start = j + 1
+        depth, paren, param, i, quote = 1, 0, 0, body_start, None
         while i < len(text):
             c = text[i]
             if quote:
@@ -545,14 +751,24 @@ def function_bodies(text: str) -> list[tuple[str, int, int, str, int, int]]:
                 nl = text.find("\n", i)
                 i = len(text) if nl < 0 else nl
                 continue
+            elif c == "(":
+                paren += 1
+            elif c == ")":
+                paren = max(0, paren - 1)
             elif c == "{":
-                depth += 1
+                if i > 0 and text[i - 1] == "$":
+                    param += 1
+                elif paren == 0:
+                    depth += 1
             elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    out.append((name, line_at(text, m.start()), line_at(text, i),
-                                text[body_start:i], body_start, i))
-                    break
+                if param:
+                    param -= 1
+                elif paren == 0:
+                    depth -= 1
+                    if depth == 0:
+                        out.append((name, line_at(text, m.start()), line_at(text, i),
+                                    text[body_start:i], body_start, i))
+                        break
             i += 1
     return out
 
@@ -580,6 +796,8 @@ BODY_RULES = [
      "escalates privileges"),
     (PRIVILEGE_RX, MEDIUM, "privilege",
      "sets SUID/SGID/capabilities; a deliberate design needs an upstream reason"),
+    (INSTALL_MODE_RX, MEDIUM, "privilege",
+     "installs a file with SUID/SGID/sticky bits; a deliberate design needs an upstream reason"),
     (SANDBOX_RX, MEDIUM, "sandbox-weakened",
      "disables the Chromium/Electron sandbox; rendered or remote content runs with the user's full privileges"),
     (re.compile(r"\bsystemctl\s+(?:enable|start)|\bcrontab\b|\.bashrc|\.profile|/autostart/"), MEDIUM, "persistence",
@@ -635,19 +853,124 @@ def strip_comment(line: str) -> str:
 ECHO_SAFE = {"echo", "printf", "msg", "msg2", "plain", "warning", "error", "note"}
 
 
+def shell_words(line: str) -> str:
+    """The line as bash word-splits it: unquote and resolve backslash escapes.
+
+    `c\\url` and `"c"url` both become `curl`; a literal inside single quotes stays
+    literal. Used for matching only; evidence keeps the original text.
+    """
+    out: list[str] = []
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                out.append(c)
+        elif quote == '"':
+            if c == "\\" and i + 1 < len(line) and line[i + 1] in '$`"\\\n':
+                if line[i + 1] != "\n":
+                    out.append(line[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+            else:
+                out.append(c)
+        else:
+            if c == "\\" and i + 1 < len(line):
+                if line[i + 1] != "\n":
+                    out.append(line[i + 1])
+                i += 2
+                continue
+            if c in "'\"":
+                quote = c
+            else:
+                out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def has_unquoted_subst(line: str) -> bool:
+    """True when `$(...)` or a backtick can execute (single quotes are literal)."""
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+            elif c == "`" or (c == "$" and i + 1 < len(line) and line[i + 1] == "("):
+                return True
+        else:
+            if c == "\\":
+                i += 2
+                continue
+            if c in "'\"":
+                quote = c
+            elif c == "`" or (c == "$" and i + 1 < len(line) and line[i + 1] == "("):
+                return True
+        i += 1
+    return False
+
+
+def has_unquoted_meta(line: str) -> bool:
+    """True when a chain, redirect, or substitution can run outside quotes.
+
+    Quoted prose (`msg "run curl | bash"`) does not count; `$(...)` inside double
+    quotes does, because bash executes it.
+    """
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+            elif c == "`" or (c == "$" and i + 1 < len(line) and line[i + 1] == "("):
+                return True
+        else:
+            if c == "\\":
+                i += 2
+                continue
+            if c in "'\"":
+                quote = c
+            elif c in ";&|`>" or (c == "$" and i + 1 < len(line) and line[i + 1] == "("):
+                return True
+        i += 1
+    return False
+
+
 def scan_body(report: Report, fname: str, body: str, first_line: int, where: str) -> None:
     for offset, raw in enumerate(body.splitlines()):
         line = first_line + offset
-        s = strip_comment(raw).strip()
-        if not s or s.startswith("#"):
+        bare = strip_comment(raw).strip()
+        if not bare or bare.startswith("#"):
             continue
-        first = s.split()[0].strip("\"'")
-        # An echo/printf line is inert only if it cannot chain or substitute.
-        if first in ECHO_SAFE and not CHAIN_META.search(s) and ">" not in s:
+        s = shell_words(bare)
+        if not s:
+            continue
+        first = s.split()[0]
+        # An echo/printf line is inert only if nothing outside quotes can chain.
+        if first in ECHO_SAFE and not has_unquoted_meta(bare.rstrip(" \t;")):
             continue
         for rx, sev, code, why in BODY_RULES:
             if rx.search(s):
-                report.add(sev, code, f"{where}: {why}", file=fname, line=line, evidence=s[:220])
+                report.add(sev, code, f"{where}: {why}", file=fname, line=line, evidence=bare[:220])
 
 
 def scan_local_source(report: Report, text: str, fname: str) -> None:
@@ -658,25 +981,25 @@ def scan_local_source(report: Report, text: str, fname: str) -> None:
     build-time fetch. The SKILL still requires reading every local source.
     """
     for offset, raw in enumerate(text.splitlines()):
-        s = strip_comment(raw).strip()
+        s = shell_words(strip_comment(raw).strip())
         if not s:
             continue
-        if PRIVILEGE_RX.search(s):
+        if PRIVILEGE_RX.search(s) or INSTALL_MODE_RX.search(s):
             report.add(MEDIUM, "privilege",
                        "local build script sets SUID/SGID/capabilities; the installed binary "
                        "gains root-owned privilege if the build runs it",
-                       file=fname, line=offset + 1, evidence=s[:220])
+                       file=fname, line=offset + 1, evidence=raw.strip()[:220])
         if SANDBOX_RX.search(s):
             report.add(MEDIUM, "sandbox-weakened",
                        "local source disables the Chromium/Electron sandbox; content rendered "
                        "by the app runs with the user's full privileges",
-                       file=fname, line=offset + 1, evidence=s[:220])
+                       file=fname, line=offset + 1, evidence=raw.strip()[:220])
 
 
 def scan_local_sources(report: Report, base: str) -> None:
     root_real = os.path.realpath(base)
     for src in report.sources:
-        if src.scheme != "" or not src.resolved or src.patch or src.sig:
+        if src.scheme != "" or not src.resolved or src.sig:
             continue
         if src.resolved.lower().endswith(IMAGE_SUFFIX):
             continue
@@ -696,6 +1019,66 @@ def scan_local_sources(report: Report, base: str) -> None:
                           src.filename or os.path.basename(src.resolved))
 
 
+def _segments(line: str) -> list[str]:
+    """Split a shell line into command segments, ignoring separators inside quotes."""
+    out: list[str] = []
+    buf: list[str] = []
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                buf.extend((c, line[i + 1] if i + 1 < len(line) else ""))
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            buf.append(c)
+        elif c in "'\"":
+            quote = c
+            buf.append(c)
+        elif c in ";&|":
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            if i + 1 < len(line) and line[i + 1] == c and c in "&|":
+                i += 1
+        else:
+            buf.append(c)
+        i += 1
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _install_lines(report: Report, fname: str, text: str, first_line: int,
+                   where: str, local_names: set[str]) -> None:
+    for offset, raw in enumerate(text.splitlines()):
+        line = first_line + offset
+        scan_body(report, fname, raw, line, where)
+        bare = strip_comment(raw).strip()
+        if not bare or bare in ("{", "}"):
+            continue
+        for seg in _segments(bare):
+            seg = seg.strip()
+            seg = re.sub(r"^(?:if|elif|while|until|then|else|do|for)\b\s*", "", seg).strip()
+            if not seg:
+                continue
+            words = shell_words(seg)
+            cmd = words.split()[0].strip("\"'") if words.split() else ""
+            if (cmd in INSTALL_SAFE or cmd in local_names or not cmd or cmd.endswith("=")
+                    or cmd.startswith("$") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg)):
+                continue
+            report.add(INFO, "install-script-command",
+                       f"{where}: `{cmd}` runs as root; read it", file=fname,
+                       line=line, evidence=seg[:220])
+            if INSTALL_ROOT_WRITE.search(seg):
+                report.add(MEDIUM, "install-script-root-write",
+                           f"{where}: writes system paths or rewrites files as root", file=fname,
+                           line=line, evidence=seg[:220])
+
+
 def scan_install(report: Report, path: str) -> None:
     with open(path, encoding="utf-8", errors="replace") as f:
         text = f.read()
@@ -703,22 +1086,12 @@ def scan_install(report: Report, path: str) -> None:
     funcs = function_bodies(text)
     local_names = {f[0] for f in funcs}
     for name, start, _end, body, _bs, _be in funcs:
-        scan_body(report, fname, body, start, f"{name}() runs as root at install/upgrade time")
-        for offset, raw in enumerate(body.splitlines()):
-            s = strip_comment(raw).strip()
-            if not s or s in ("{", "}"):
-                continue
-            cmd = s.split()[0].strip("\"'")
-            if (cmd in INSTALL_SAFE or cmd in local_names or cmd.endswith("=")
-                    or cmd.startswith("$") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s)):
-                continue
-            report.add(INFO, "install-script-command",
-                       f"{name}() runs `{cmd}` as root; read the whole function", file=fname,
-                       line=start + offset, evidence=s[:220])
-            if INSTALL_ROOT_WRITE.search(s):
-                report.add(MEDIUM, "install-script-root-write",
-                           f"{name}() writes system paths or rewrites files as root", file=fname,
-                           line=start + offset, evidence=s[:220])
+        _install_lines(report, fname, body, start,
+                       f"{name}() runs as root at install/upgrade time", local_names)
+    # libalpm sources the scriptlet (`. <file>; <fn> ...`), so top-level code runs as root too.
+    top = mask_spans(text, [(text.rfind("\n", 0, f[4]) + 1, f[5]) for f in funcs])
+    _install_lines(report, fname, top, 1,
+                   f"{fname} top-level code runs as root when pacman sources it", local_names)
 
 
 def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Source]:
@@ -726,33 +1099,67 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
         r"^[ \t]*source_([A-Za-z0-9_]+)\+?=\s*\(", text, re.MULTILINE)})
     report.sources = []
     images: list[str] = []
+    scoped_all: list[tuple[str, int]] = []
     for suffix in suffixes:
         tag = f"_{suffix}" if suffix else ""
-        entries = parse_array(text, "source" + tag) or []
+        entries = parse_any(text, "source" + tag) or []
+        sums_arrays = {alg: parse_any(text, alg + tag) for alg in SUMS}
+        cksum_items = parse_any(text, "cksums" + tag)
+
+        scoped: list[tuple[str, int]] = []
+        for arr in ["source" + tag] + [alg + tag for alg in SUMS] + ["cksums" + tag]:
+            scoped.extend((arr, line) for _kind, line in scoped_assignments(text, arr))
+        scoped_all.extend(scoped)
         if not entries:
             continue
-        sums_arrays = {alg: parse_array(text, alg + tag) for alg in SUMS}
-        if not any(sums_arrays.values()):
-            report.add(HIGH, "missing-checksums",
-                       f"no {tag.lstrip('_') + ' ' if tag else ''}checksum array accompanies the sources",
-                       line=line_of(text, "source" + tag + "="), evidence="")
+        unresolved: list[str] = []
+        for raw, _line in entries:
+            _, _, url = raw.partition("::") if "::" in raw.split("://")[0] else ("", "", raw)
+            if "$(" in raw or "`" in raw:
+                unresolved.append(raw)
+                continue
+            if not expand_deep(url, vars_)[1]:
+                unresolved.append(raw)
+        scope_unresolved = bool(scoped) or bool(unresolved)
+
+        if not any(sums_arrays.values()) and not cksum_items:
+            if scope_unresolved:
+                report.add(INFO, "checksum-count-unresolved",
+                           f"no static checksum array accompanies source{tag}; "
+                           "a scoped or unexpandable assignment may supply it at build time",
+                           line=line_of(text, "source" + tag + "="), evidence="")
+            else:
+                report.add(HIGH, "missing-checksums",
+                           f"no {tag.lstrip('_') + ' ' if tag else ''}checksum array accompanies the sources",
+                           line=line_of(text, "source" + tag + "="), evidence="")
         strong_present = any(sums_arrays.get(alg) for alg in STRONG)
         for alg in ("md5sums", "sha1sums"):
             if sums_arrays.get(alg):
                 report.add(LOW if strong_present else HIGH, "weak-checksum",
                            f"{alg}{tag} is cryptographically broken for integrity review",
                            line=line_of(text, alg + tag))
+        if cksum_items:
+            report.add(LOW if strong_present else HIGH, "weak-checksum",
+                       f"cksums{tag} is a CRC and cannot attest integrity",
+                       line=line_of(text, "cksums" + tag))
         for alg, items in sums_arrays.items():
             if items and len(items) != len(entries):
-                if array_is_static(text, alg + tag) and array_is_static(text, "source" + tag):
+                if (not scope_unresolved and array_is_static(text, alg + tag)
+                        and array_is_static(text, "source" + tag)):
                     report.add(HIGH, "checksum-count-mismatch",
                                f"{alg}{tag} has {len(items)} entries for {len(entries)} sources",
                                line=line_of(text, alg + tag))
                 else:
                     report.add(INFO, "checksum-count-unresolved",
                                f"{alg}{tag} has {len(items)} entries for {len(entries)} sources; "
-                               "conditional or indexed assignments make the static count unreliable",
+                               "conditional, indexed, or unexpandable assignments make the static count unreliable",
                                line=line_of(text, alg + tag))
+        if scoped:
+            report.add(INFO, "checksum-count-unresolved",
+                       f"source{tag} is reassigned in a function or conditional block; "
+                       "the build-time source/checksum count cannot be derived statically",
+                       line=scoped[0][1],
+                       evidence=f"{scoped[0][0]} assignment ignored")
 
         for idx, (raw, line) in enumerate(entries):
             name_part, _, url = raw.partition("::") if "::" in raw.split("://")[0] else ("", "", raw)
@@ -760,6 +1167,7 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
             resolved, expanded_ok = expand_deep(url, vars_)
             m = re.match(r"^([A-Za-z0-9+]+)://", resolved)
             scheme = m.group(1) if m else ""
+            bare = re.sub(r"^(?:git|svn|hg|bzr|fossil)\+", "", scheme)
             low = resolved.lower()
             low_name = name_part.lower()
             name_resolved, name_ok = expand_deep(name_part.strip(), vars_) if name_part.strip() else ("", True)
@@ -767,10 +1175,10 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
                 name_resolved = os.path.basename(
                     urllib.parse.urlsplit(resolved if expanded_ok else url).path)
             src = Source(raw=raw, url=url, line=line, scheme=scheme,
-                         vcs=resolved.startswith(VCS_PREFIX) or scheme in ("git", "svn", "hg", "bzr"),
+                         vcs=resolved.startswith(VCS_PREFIX) or scheme in ("git", "svn", "hg", "bzr", "fossil"),
                          sig=low.endswith(SIG_SUFFIX) or low_name.endswith(SIG_SUFFIX),
                          patch=low.endswith(PATCH_SUFFIX) or low_name.endswith(PATCH_SUFFIX),
-                         resolved=resolved if expanded_ok else "",
+                         resolved=resolved,
                          filename=name_resolved if name_ok else "")
             for alg, items in sums_arrays.items():
                 if items and idx < len(items):
@@ -778,6 +1186,7 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
             report.sources.append(src)
 
             if dynamic:
+                src.verify = "dynamic-source"
                 report.add(HIGH, "dynamic-source",
                            "source entry is computed by a command substitution; the reviewed text is not the fetched URL",
                            line=line, evidence=raw[:220])
@@ -786,12 +1195,12 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
                 report.add(MEDIUM, "source-unresolved",
                            "source URL uses a variable the collector cannot expand; its real host was not reviewed",
                            line=line, evidence=raw[:220])
-            if scheme in ("http", "git", "svn", "ftp", "tftp"):
-                report.add(HIGH if scheme == "http" else MEDIUM, "insecure-scheme",
-                           f"source uses unauthenticated {scheme}://; "
+            if bare in ("http", "git", "svn", "ftp", "tftp"):
+                report.add(HIGH if bare == "http" else MEDIUM, "insecure-scheme",
+                           f"source uses unauthenticated {bare}://; "
                            "checksums in the PKGBUILD do not authenticate the transport",
                            line=line, evidence=raw[:220])
-            elif not scheme and expanded_ok and not dynamic and not src.vcs and not src.patch and not src.sig:
+            elif not scheme and expanded_ok and not dynamic and not src.vcs and not src.sig:
                 if os.path.isabs(resolved) or ".." in resolved.split("/"):
                     src.verify = "local-escapes-snapshot"
                     report.add(MEDIUM, "source-unverified",
@@ -799,6 +1208,10 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
                                line=line, evidence=raw[:220])
                 elif resolved.lower().endswith(IMAGE_SUFFIX):
                     images.append(os.path.basename(resolved))
+                elif src.patch:
+                    report.add(INFO, "local-source",
+                               "source is a patch shipped in the AUR repo; read it before approving",
+                               line=line, evidence=raw[:220])
                 else:
                     report.add(INFO, "local-source",
                                "source is a file shipped in the AUR repo; read it with the PKGBUILD",
@@ -818,6 +1231,12 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
                                f"{alg}{tag} value is not {SUMS[alg]} hex characters",
                                line=line, evidence=f"{alg}={v[:80]}")
 
+    if scoped_all:
+        for arr, line in sorted(set(scoped_all), key=lambda item: (item[1], item[0])):
+            report.add(MEDIUM, "array-index-unresolved",
+                       f"{arr} is reassigned inside a function or conditional block; "
+                       "that assignment does not change the build-time array makepkg verifies",
+                       line=line, evidence=f"{arr} assignment ignored")
     if images:
         report.add(INFO, "local-source",
                    f"{len(images)} image assets shipped in the AUR repo; hashed but not executable")
@@ -832,12 +1251,12 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
                                "the source/checksum table may not reflect the build",
                                line=line, evidence=f"{arr}[{idx_raw}]")
 
-    if any(s.sig for s in report.sources) and not parse_array(text, "validpgpkeys"):
+    if any(s.sig for s in report.sources) and not parse_any(text, "validpgpkeys"):
         report.add(MEDIUM, "signature-not-verified",
                    "a signature source is declared but validpgpkeys is absent: any trusted key "
                    "in the user's keyring is accepted",
                    line=line_of(text, "source="), evidence="no validpgpkeys= in the PKGBUILD")
-    pkgnames = vars_.get("_pkgnames") or []
+    pkgnames = report.pkgnames
     if looks_prebuilt(function_bodies(text), report.sources, pkgnames):
         report.add(MEDIUM, "prebuilt-payload",
                    "prebuilt payload: the package ships a downloaded binary or archive, so the "
@@ -853,7 +1272,7 @@ def parse_sources(report: Report, text: str, vars_: dict[str, str]) -> list[Sour
 def expand_vars(value: str, vars_: dict[str, str]) -> tuple[str, bool]:
     ok = True
 
-    def repl(m: re.Match) -> str:
+    def repl(m: re.Match[str]) -> str:
         nonlocal ok
         key = m.group(1) or m.group(2)
         if key in vars_:
@@ -861,9 +1280,12 @@ def expand_vars(value: str, vars_: dict[str, str]) -> tuple[str, bool]:
         ok = False
         return m.group(0)
 
-    # Only a complete `$name` or `${name}`; `${name/pat/rep}` is left intact and
-    # reported as unresolved, never half-expanded.
-    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", repl, value), ok
+    # Only a complete `$name` or `${name}` is expanded. Anything left (`$`, `${x/…}`,
+    # `${arr[@]…}`, `$(…)`) is unresolved: the real URL was never reviewed.
+    expanded = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", repl, value)
+    if "$" in expanded:
+        ok = False
+    return expanded, ok
 
 
 def expand_deep(value: str, vars_: dict[str, str]) -> tuple[str, bool]:
@@ -881,7 +1303,7 @@ def expand_deep(value: str, vars_: dict[str, str]) -> tuple[str, bool]:
     return cur, ok
 
 
-def _new_hash(alg: str):
+def _new_hash(alg: str) -> Any:
     return hashlib.new(alg.replace("sums", "").replace("b2", "blake2b"))
 
 
@@ -890,31 +1312,76 @@ def _digest_file(path: str, alg: str) -> str:
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()
+    return str(h.hexdigest())
 
 
 def _digest_file_multi(path: str, algs: list[str]) -> dict[str, str]:
-    hs = {alg: _new_hash(alg) for alg in algs}
+    hs: dict[str, Any] = {alg: _new_hash(alg) for alg in algs}
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             for h in hs.values():
                 h.update(chunk)
-    return {alg: h.hexdigest() for alg, h in hs.items()}
+    return {alg: str(h.hexdigest()) for alg, h in hs.items()}
+
+
+def _cache_url(cache_path: str) -> str | None:
+    try:
+        with open(cache_path + ".url", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _cache_matches(cache_path: str | None, url: str) -> bool:
+    """True only for a cache file this tool downloaded from the same URL."""
+    return bool(cache_path and os.path.isfile(cache_path) and not os.path.islink(cache_path)
+                and _cache_url(cache_path) == url)
+
+
+def _write_cache_url(cache_path: str, url: str) -> None:
+    marker = cache_path + ".url"
+    tmp = marker + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(url + "\n")
+    os.replace(tmp, marker)
+
+
+def _drop_cache(cache_path: str) -> None:
+    for path in (cache_path, cache_path + ".url"):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _open_part(part: str) -> IO[bytes]:
+    """Open the cache staging file without following symlinks."""
+    for _ in range(2):
+        try:
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            return os.fdopen(fd, "wb")
+        except FileExistsError:
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+    raise ValueError("cache staging path is not a safe regular file")
 
 
 def _digest_url_multi(url: str, algs: list[str], cache_path: str | None = None) -> dict[str, str]:
     """Download once and hash the same bytes with every requested algorithm.
 
-    With `cache_path`, reuse an already verified download or persist the bytes
-    for the later build (`SRCDEST`), so the same payload is not fetched twice.
+    With `cache_path`, reuse bytes only when this tool recorded the same URL in
+    the sidecar, then persist the download for the later build (`SRCDEST`).
     """
-    if cache_path and os.path.isfile(cache_path):
+    if cache_path is not None and _cache_matches(cache_path, url):
         return _digest_file_multi(cache_path, algs)
-    hs = {alg: _new_hash(alg) for alg in algs}
+    hs: dict[str, Any] = {alg: _new_hash(alg) for alg in algs}
     total = 0
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     part = cache_path + ".part" if cache_path else None
-    out = open(part, "wb") if part else None
+    out = _open_part(part) if part else None
     try:
         with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as r:
             final = r.geturl()
@@ -941,9 +1408,13 @@ def _digest_url_multi(url: str, algs: list[str], cache_path: str | None = None) 
     finally:
         if out:
             out.close()
-    if part:
+    if part and cache_path:
         os.replace(part, cache_path)
-    return {alg: h.hexdigest() for alg, h in hs.items()}
+        try:
+            _write_cache_url(cache_path, url)
+        except OSError:
+            pass  # the bytes are still usable by makepkg; reuse is just disabled
+    return {alg: str(h.hexdigest()) for alg, h in hs.items()}
 
 
 def upstream_sums(url: str) -> tuple[dict[str, str] | None, str]:
@@ -1033,7 +1504,7 @@ def npm_verify_signatures(meta: dict) -> tuple[bool | None, str]:
             result = subprocess.run(
                 ["openssl", "dgst", "-sha256", "-verify", key_path, "-keyform", "DER",
                  "-signature", sig_path, msg_path],
-                capture_output=True,
+                capture_output=True, check=False,
             )
             verified += result.returncode == 0
     return verified == len(sigs), f"npm registry signatures {verified}/{len(sigs)} verified"
@@ -1075,12 +1546,7 @@ def verify_sources(report: Report, vars_: dict[str, str], root: str, remote: boo
         if src.sig and src.scheme != "":
             src.verify = "not-applicable"
             continue
-        if src.verify in ("local-escapes-snapshot", "unexpanded-variable"):
-            continue
-        alg = next((a for a in STRONG if src.sums.get(a) and src.sums[a].upper() != "SKIP"), None)
-        if not alg:
-            # A signature with no hash is exempt by design; anything else is a gap.
-            src.verify = "not-applicable" if src.sig else "no-strong-sum"
+        if src.verify in ("local-escapes-snapshot", "unexpanded-variable", "dynamic-source"):
             continue
         if src.scheme == "":
             if not src.resolved:
@@ -1102,7 +1568,16 @@ def verify_sources(report: Report, vars_: dict[str, str], root: str, remote: boo
                            f"local source {src.resolved!r} is absent from the snapshot",
                            line=src.line, evidence=src.raw[:200])
                 continue
+            alg = next((a for a in STRONG if src.sums.get(a) and src.sums[a].upper() != "SKIP"), None)
+            if not alg:
+                # A signature with no hash is exempt by design; anything else is a gap.
+                src.verify = "not-applicable" if src.sig else "no-strong-sum"
+                continue
             _record_hash(report, src, alg, _digest_file(path, alg), src.sums[alg], "snapshot file")
+            continue
+        alg = next((a for a in STRONG if src.sums.get(a) and src.sums[a].upper() != "SKIP"), None)
+        if not alg:
+            src.verify = "no-strong-sum"
             continue
         if src.scheme != "https":
             src.verify = "unverifiable"
@@ -1127,10 +1602,14 @@ def verify_sources(report: Report, vars_: dict[str, str], root: str, remote: boo
         cache_path = None
         if cache_dir and _safe_cache_name(src.filename):
             cache_path = os.path.join(cache_dir, src.filename)
-        was_cached = bool(cache_path and os.path.isfile(cache_path))
+        was_cached = _cache_matches(cache_path, src.resolved)
+        if cache_path and os.path.isfile(cache_path) and not was_cached:
+            # A same-named file we cannot attribute to this URL: never hash, reuse,
+            # or overwrite it. Download without caching instead.
+            cache_path = None
         try:
             digests = _digest_url_multi(src.resolved, algs, cache_path)
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
             src.verify = f"download-failed: {str(e)[:120]}"
             report.add(MEDIUM, "source-unverified",
                        "source could not be downloaded for checksum verification "
@@ -1144,11 +1623,8 @@ def verify_sources(report: Report, vars_: dict[str, str], root: str, remote: boo
         got = digests[alg]
         _record_hash(report, src, alg, got, src.sums[alg], "downloaded source")
         if src.verify != "verified":
-            if cache_path and os.path.isfile(cache_path):
-                try:
-                    os.unlink(cache_path)
-                except OSError:
-                    pass
+            if cache_path:  # our cache record for this URL is stale; force a re-download
+                _drop_cache(cache_path)
             continue
         if npm:
             meta, why = npm_packument(src.resolved)
@@ -1159,10 +1635,15 @@ def verify_sources(report: Report, vars_: dict[str, str], root: str, remote: boo
                 continue
             integrity = meta.get("integrity", "")
             got512 = digests.get("sha512sums", "")
-            ok512 = bool(integrity.startswith("sha512-") and got512) and (
-                base64.b64encode(bytes.fromhex(got512)).decode() == integrity.split("-", 1)[1])
+            if integrity.startswith("sha512-") and got512:
+                ok512: bool | None = (
+                    base64.b64encode(bytes.fromhex(got512)).decode()
+                    == integrity.split("-", 1)[1])
+            else:
+                ok512 = None
+            shasum = meta.get("shasum", "")
             got1 = digests.get("sha1sums", "")
-            ok1 = bool(meta.get("shasum")) and got1 == meta.get("shasum")
+            ok1: bool | None = (got1 == shasum) if (shasum and got1) else None
             sig_ok, sig_msg = npm_verify_signatures(meta)
             if sig_msg == "no npm registry signatures":
                 sig_text = "no registry signatures"
@@ -1170,10 +1651,11 @@ def verify_sources(report: Report, vars_: dict[str, str], root: str, remote: boo
                 sig_text = f"signatures not checked ({sig_msg})"
             else:
                 sig_text = sig_msg
+            state = {None: "not published", True: "matches", False: "differs"}
             src.provenance = (f"npm {meta['package']}@{meta['version']}: "
-                              f"sha512 integrity {'matches' if ok512 else 'differs'}, "
-                              f"sha1 shasum {'matches' if ok1 else 'differs'}, {sig_text}")
-            if not ok512 or not ok1 or sig_ok is False:
+                              f"sha512 integrity {state[ok512]}, "
+                              f"sha1 shasum {state[ok1]}, {sig_text}")
+            if ok512 is False or ok1 is False or sig_ok is False:
                 report.add(HIGH, "provenance-mismatch",
                            "npm metadata contradicts the downloaded tarball",
                            line=src.line, evidence=src.resolved[:200])
@@ -1220,12 +1702,11 @@ def scan_pkgbuild(report: Report, text: str) -> dict[str, str]:
         + NAME_RE + r"[ \t]*\(\)[ \t]*\{?|"
         r"function[ \t]+" + NAME_RE + r"[ \t]*(?:\(\))?[ \t]*\{?|"
         r"[A-Za-z0-9_*?|.-]+\)|"
-        r"#|$|[{}]|"
+        r"#|$|[{}]|\(|\)|"
         r"if\b|then\b|else\b|elif\b|fi\b|for\b|do\b|done\b|while\b|until\b|select\b|"
         r"case\b|esac\b|:(?:\s|$)|\[\[?|test\b|export\b|unset\b|"
         + echo_alt + r"\b)"
     )
-    local_fn = {f[0] for f in funcs}
     dangerous_subst = re.compile(
         r"\$\([^)]*(?:\b(?:curl|wget|aria2c|ncat|socat|nc|sh|bash|zsh|eval|base64|"
         r"python[0-9.]*|perl|sudo|su)\b|[|;])"
@@ -1235,7 +1716,7 @@ def scan_pkgbuild(report: Report, text: str) -> dict[str, str]:
         s = strip_comment(raw).strip()
         if not s:
             continue
-        substituted = "$(" in s or "`" in s
+        substituted = has_unquoted_subst(s)
         if substituted:
             sev = HIGH if dangerous_subst.search(s) else MEDIUM
             code = "dynamic-shell" if sev == HIGH else "top-level-substitution"
@@ -1243,14 +1724,21 @@ def scan_pkgbuild(report: Report, text: str) -> dict[str, str]:
                        "top level: command substitution runs when the PKGBUILD is sourced",
                        line=idx, evidence=s[:220])
             continue
-        first_match = re.match(r"^[ \t]*([A-Za-z_][A-Za-z0-9_-]*)", raw)
-        first_name = first_match.group(1) if first_match else ""
-        if allowed.match(raw) or first_name in local_fn:
+        if allowed.match(raw):
+            control = bool(re.match(
+                r"^(?:if|elif|while|until|for|case|then|else|do|fi|esac|done)\b", s))
+            hits: list[tuple[str, str, str]] = []
             if (re.match(r"^[ \t]*(?:if|elif|while|until)\b", raw)
                     or CHAIN_META.search(s)):
-                for rx, sev, code, why in BODY_RULES:
-                    if rx.search(s):
-                        report.add(sev, code, f"top level: {why}", line=idx, evidence=s[:220])
+                hits = [(sev, code, why) for rx, sev, code, why in BODY_RULES if rx.search(s)]
+                for sev, code, why in hits:
+                    report.add(sev, code, f"top level: {why}", line=idx, evidence=s[:220])
+            if (not hits and not control and CHAIN_META.search(s)
+                    and not any(a <= idx <= b for a, b in array_spans)):
+                report.add(MEDIUM, "top-level-command",
+                           "a command chained after a top-level assignment runs when the "
+                           "PKGBUILD is sourced",
+                           line=idx, evidence=s[:220])
             continue
         if any(a <= idx <= b for a, b in array_spans):
             continue
@@ -1312,14 +1800,14 @@ def audit_pkgbuild_dir(report: Report, root: str, vars_: dict[str, str],
         scalar = parse_scalar(text, "pkgname")
         if scalar:
             pkgnames = [scalar]
-    expanded_names = []
+    expanded_names: list[str] = []
     for v in pkgnames:
         ev, ok = expand_deep(v, vars_)
         expanded_names.append(ev if ok else v)
     pkgnames = expanded_names
+    report.pkgnames = pkgnames
     if pkgnames:
         vars_["pkgname"] = pkgnames[0]
-        vars_["_pkgnames"] = pkgnames
         vars_.setdefault("pkgbase", pkgnames[0])
     archs = [v for v, _ in parse_array_head(text, "arch")]
     if len(archs) == 1 and archs[0] != "any":
@@ -1349,7 +1837,8 @@ def audit_pkgbuild_dir(report: Report, root: str, vars_: dict[str, str],
     else:
         sum_prefixes = tuple(a + "_" for a in SUMS)
         for key, values in srcinfo.items():
-            is_array = key in SRCINFO_ARRAYS or key.startswith(("source_", *sum_prefixes))
+            is_array = (key in SRCINFO_ARRAYS or key.startswith(("source_", *sum_prefixes))
+                        or key.split("_", 1)[0] in SRCINFO_ARRAYS)
             if not is_array:
                 continue
             if not array_is_static(text, key):
@@ -1373,15 +1862,50 @@ def audit_pkgbuild_dir(report: Report, root: str, vars_: dict[str, str],
                        evidence=f".SRCINFO={str(src_item)[:80]!r} "
                                 f"PKGBUILD={str(pkg_item)[:80]!r}")
 
+    root = os.path.realpath(os.path.dirname(os.path.abspath(pkgbuild)))
     declared_install = parse_scalar(text, "install")
+    install_target: str | None = None
     if declared_install:
         resolved, complete = expand_vars(declared_install, vars_)
-        if complete and not os.path.isfile(os.path.join(os.path.dirname(pkgbuild), resolved)):
-            report.add(MEDIUM, "install-missing", f"install={declared_install} resolves to {resolved}, absent from the snapshot")
-    for name in sorted(os.listdir(os.path.dirname(pkgbuild))):
-        if name.endswith(".install"):
-            scan_install(report, os.path.join(os.path.dirname(pkgbuild), name))
+        if not complete or "$" in resolved:
+            report.add(MEDIUM, "install-missing",
+                       f"install={declared_install} uses a variable the collector cannot expand; "
+                       "locate and read the script it names")
+        else:
+            candidate = os.path.realpath(os.path.join(root, resolved))
+            if candidate != root and not candidate.startswith(root + os.sep):
+                report.add(MEDIUM, "install-missing",
+                           f"install={declared_install} resolves outside the snapshot; not read",
+                           evidence=resolved[:200])
+            elif not os.path.isfile(candidate):
+                report.add(MEDIUM, "install-missing",
+                           f"install={declared_install} resolves to {resolved}, absent from the snapshot")
+            else:
+                install_target = candidate
+    targets: list[str] = [install_target] if install_target else []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if name.endswith(".install"):
+                path = os.path.realpath(os.path.join(dirpath, name))
+                if path == root or path.startswith(root + os.sep):
+                    targets.append(path)
+    seen: set[str] = set()
+    for path in targets:
+        if path not in seen:
+            seen.add(path)
+            scan_install(report, path)
     return pkgbuild
+
+
+def _display(value: str) -> str:
+    """Escape control characters so hostile package text cannot rewrite the terminal."""
+    out: list[str] = []
+    for ch in value:
+        if ch.isprintable() and ch not in "\n\r\t":
+            out.append(ch)
+        else:
+            out.append(ch.encode("unicode_escape").decode("ascii", "replace"))
+    return "".join(out)
 
 
 def human_report(report: Report) -> str:
@@ -1402,6 +1926,8 @@ def human_report(report: Report) -> str:
             verdict = "CLEAN (sources verified)"
     else:
         verdict = "CLEAN (form only; no sources verified)"
+    if report.history_note and verdict.startswith("CLEAN"):
+        verdict = "REVIEW (AUR git history unavailable)"
     report.verdict = verdict
     head = f"AUR security audit: {report.package}" + (f" {report.version}" if report.version else "")
     if report.submitted or report.maintainer:
@@ -1428,7 +1954,8 @@ def human_report(report: Report) -> str:
                              for a, v in s.sums.items()) or "no sums"
             kind = "vcs" if s.vcs else "sig" if s.sig else s.scheme or "local"
             shown = s.resolved or s.url
-            out.append(f"  L{s.line or '?'} [{kind:4}] {shown[:110]}  ({sums}) verify={s.verify}")
+            cut = "…" if len(shown) > 110 else ""
+            out.append(f"  L{s.line or '?'} [{kind:4}] {shown[:110]}{cut}  ({sums}) verify={s.verify}")
             if s.provenance:
                 out.append(f"           provenance: {s.provenance}")
         out.append("")
@@ -1436,18 +1963,26 @@ def human_report(report: Report) -> str:
         out.append(f"History: {report.commits} commits")
         for a in report.authors[:6]:
             out.append(f"  {a['last'][:10]}  {a['commits']:4}  {a['name']} <{a['email']}>  {a['last_subject'][:70]}")
+        if len(report.authors) > 6:
+            out.append(f"  … {len(report.authors) - 6} more authors (full list in --json)")
+        out.append("")
+    if report.history_note:
+        out.append(f"Note: AUR git history unavailable: {report.history_note}")
         out.append("")
     if report.last_change_diff:
         out.append("Last PKGBUILD/.install change:")
-        out.extend("  " + ln for ln in report.last_change_diff.splitlines()[:60])
+        diff_lines = report.last_change_diff.splitlines()
+        out.extend("  " + ln for ln in diff_lines[:60])
+        if len(diff_lines) > 60:
+            out.append(f"  … {len(diff_lines) - 60} more lines omitted (full diff in --json)")
         out.append("")
     for n in report.notes:
         out.append(f"Note: {n}")
-    return "\n".join(out)
+    return "\n".join(_display(line) for line in out)
 
 
 class Parser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:  # usage errors must not look like HIGH findings
+    def error(self, message: str) -> NoReturn:  # usage errors must not look like HIGH findings
         self.print_usage(sys.stderr)
         self.exit(64, f"{self.prog}: error: {message}\n")
 
@@ -1467,6 +2002,10 @@ def main() -> int:
 
     if not args.package and not args.pkgbuild:
         ap.error("give an AUR package name or --pkgbuild")
+    if args.package and args.pkgbuild:
+        ap.error("give either an AUR package name or --pkgbuild, not both")
+    if args.keep_snapshot and args.pkgbuild:
+        ap.error("--keep-snapshot applies to AUR audits, not --pkgbuild")
 
     keep = os.path.abspath(args.keep_snapshot) if args.keep_snapshot else None
     if args.pkgbuild:
@@ -1519,7 +2058,16 @@ def main() -> int:
                         report.add(INFO, "thin-history", f"only {commits} commits; little review trail")
 
         if args.cache_dir:
-            os.makedirs(args.cache_dir, exist_ok=True)
+            try:
+                os.makedirs(args.cache_dir, mode=0o700, exist_ok=True)
+                st = os.stat(args.cache_dir)
+            except OSError as e:
+                raise SystemExit(f"aur-security-audit: cache dir unusable: {e}")
+            if st.st_uid != os.getuid():
+                raise SystemExit(
+                    f"aur-security-audit: cache dir {args.cache_dir} is not owned by the current user")
+            if st.st_mode & 0o077:
+                os.chmod(args.cache_dir, 0o700)
         downloaded, cached = verify_sources(report, vars_, source_root,
                                             remote=args.verify_sources, cache_dir=args.cache_dir)
         verified_all = bool(report.sources) and all(
@@ -1535,13 +2083,14 @@ def main() -> int:
             report.notes.append("remote sources were not downloaded (rerun with --verify-sources); "
                                 "local snapshot files were hashed")
         elif args.cache_dir and (downloaded or cached):
-            report.notes.append(f"downloaded {downloaded} sources into {args.cache_dir}; "
-                                f"reuse with SRCDEST={args.cache_dir} makepkg -s")
+            if downloaded:
+                report.notes.append(f"downloaded {downloaded} source(s) into {args.cache_dir}")
             if cached:
-                report.notes.append(f"{cached} sources were read from the cache")
+                report.notes.append(f"{cached} source(s) were read from the cache")
+            report.notes.append(f"reuse with SRCDEST={args.cache_dir} makepkg -s")
         if keep:
             report.notes.append(f"snapshot kept at {report.snapshot or workdir}")
-        elif not args.pkgbuild:
+        else:
             report.snapshot = None  # the temporary extraction is deleted below
         print(human_report(report))
         if args.json:
@@ -1556,8 +2105,14 @@ def main() -> int:
                 "sources": [s.__dict__ for s in report.sources],
                 "findings": [f.__dict__ for f in report.findings],
             }
-            with open(args.json, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
+            target_dir = os.path.dirname(os.path.abspath(args.json)) or "."
+            try:
+                fd, tmp_json = tempfile.mkstemp(dir=target_dir, prefix=".aur-audit-", suffix=".json")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                os.replace(tmp_json, args.json)
+            except OSError as e:
+                raise SystemExit(f"aur-security-audit: could not write JSON report: {e}")
         return 2 if any(f.severity == HIGH for f in report.findings) else 0
     finally:
         if args.pkgbuild or not keep:
